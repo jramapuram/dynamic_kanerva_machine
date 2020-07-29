@@ -1,5 +1,6 @@
 import os
 import time
+import rpyc
 import tree
 import argparse
 import functools
@@ -8,6 +9,7 @@ import torch
 import torchvision
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import torch.multiprocessing as mp
 import numpy as np
 
@@ -19,7 +21,7 @@ import helpers.layers as layers
 import helpers.utils as utils
 import optimizers.scheduler as scheduler
 
-from models.vae import build_vae
+from models.dkm import DynamicKanervaMachine
 from datasets.loader import get_loader
 from helpers.grapher import Grapher
 from helpers.fid_client import FIDClient
@@ -56,14 +58,6 @@ parser.add_argument('--nll-type', type=str, default='bernoulli',
                     help='bernoulli or gaussian (default: bernoulli)')
 parser.add_argument('--reparam-type', type=str, default='isotropic_gaussian',
                     help='isotropic_gaussian, discrete or mixture [default: isotropic_gaussian]')
-parser.add_argument('--continuous-size', type=int, default=32, metavar='L',
-                    help='latent size of continuous variable when using mixture or gaussian (default: 32)')
-parser.add_argument('--discrete-size', type=int, default=1,
-                    help='initial dim of discrete variable when using mixture or gumbel (default: 1)')
-parser.add_argument('--continuous-mut-info', type=float, default=0.0,
-                    help='-continuous_mut_info * I(z_c; x) is applied (opposite dir of disc)(default: 0.0)')
-parser.add_argument('--discrete-mut-info', type=float, default=0.0,
-                    help='+discrete_mut_info * I(z_d; x) is applied (default: 0.0)')
 parser.add_argument('--generative-scale-var', type=float, default=1.0,
                     help='scale variance of prior in order to capture outliers')
 parser.add_argument('--aggregate-posterior-ema-decay', type=float, default=0.9,
@@ -99,21 +93,20 @@ parser.add_argument('--decoder-channel-multiplier', type=float, default=0.5,
 parser.add_argument('--model-dir', type=str, default='.models',
                     help='directory which contains saved models (default: .models)')
 
-# RNN Related
-parser.add_argument('--clip', type=float, default=0,
-                    help='gradient clipping for RNN (default: 0.25)')
-parser.add_argument('--use-prior-kl', action='store_true', default=False,
-                    help='add a kl on the VRNN prior against the true prior (default: False)')
-parser.add_argument('--use-noisy-rnn-state', action='store_true', default=False,
-                    help='uses a noisy initial rnn state instead of zeros (default: False)')
-parser.add_argument('--max-time-steps', type=int, default=0,
-                    help='max time steps for RNN or MSGVAE (default: 0)')
-parser.add_argument('--mut-clamp-strategy', type=str, default="clamp",
-                    help='clamp mut info by norm / clamp / none (default: clamp)')
-parser.add_argument('--mut-clamp-value', type=float, default=100.0,
-                    help='max / min clamp value if above strategy is clamp (default: 100.0)')
+
+# Temporal encoder / memory related
+parser.add_argument('--shift-div', type=int, default=8,
+                    help='shift div becomes (1/shift_div) in TSM encoder (default: 8)')
+parser.add_argument('--code-size', type=int, default=100,
+                    help='code size for memory operations (default: 100)')
+parser.add_argument('--memory-size', type=int, default=32,
+                    help='sizing for square memory (default: 32)')
+parser.add_argument('--episode-length', type=int, default=10,
+                    help='number of samples per episode (default: 10)')
 
 # Regularizer
+parser.add_argument('--clip', type=float, default=0,
+                    help='gradient clipping (default: 0)')
 parser.add_argument('--kl-annealing-cycles', type=int, default=None, help='cycles for kl-annealing (default: None)')
 parser.add_argument('--kl-beta', type=float, default=1, help='beta-vae kl term (default: 1)')
 parser.add_argument('--weight-decay', type=float, default=0, help='weight decay (default: 0)')
@@ -309,14 +302,14 @@ def build_loader_model_grapher(args):
     # set the input tensor shape (ignoring batch dimension) and related dataset sizing
     args.input_shape = loader.input_shape
     args.output_size = loader.output_size
-    args.num_train_samples = loader.num_train_samples // args.num_replicas
+    args.num_train_samples = loader.num_train_samples // (args.num_replicas * args.episode_length)
     args.num_test_samples = loader.num_test_samples  # Test isn't currently split across devices
-    args.num_valid_samples = loader.num_valid_samples // args.num_replicas
+    args.num_valid_samples = loader.num_valid_samples // (args.num_replicas * args.episode_length)
     args.steps_per_train_epoch = args.num_train_samples // args.batch_size  # drop-remainder
     args.total_train_steps = args.epochs * args.steps_per_train_epoch
 
     # build the network
-    network = build_vae(args.vae_type)(loader.input_shape, kwargs=deepcopy(vars(args)))
+    network = DynamicKanervaMachine(loader.input_shape, kwargs=deepcopy(vars(args)))
     network = network.cuda() if args.cuda else network
     lazy_generate_modules(network, loader.train_loader)
     network = layers.init_weights(network, init=args.weight_initialization)
@@ -358,26 +351,38 @@ def lazy_generate_modules(model, loader):
 
     """
     model.eval()
-    for minibatch, labels in loader:
+    minibatches, labels = [], []
+
+    for minibatch, label in loader:
         with torch.no_grad():
+            minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
+            label = label.cuda(non_blocking=True) if args.cuda else label
+
+            if len(minibatches) < args.episode_length:
+                minibatches.append(minibatch)
+                labels.append(label)
+                continue
+
             # Some sanity prints on the minibatch and labels
             print("minibatch = {} / {} | labels = {} / {}".format(minibatch.shape,
                                                                   minibatch.dtype,
-                                                                  labels.shape,
-                                                                  labels.dtype))
+                                                                  label.shape,
+                                                                  label.dtype))
             mb_min, mb_max = minibatch.min(), minibatch.max()
             print("minibatch in range [min: {}, max: {}]".format(mb_min, mb_max))
             if mb_max > 1.0 or mb_min < 0:
                 raise ValueError("Minibatch max > 1.0 or minibatch min < 0. You probably dont want this.")
 
-            minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
-            labels = labels.cuda(non_blocking=True) if args.cuda else labels
-            _ = model(minibatch, labels=labels)
+            _ = model(minibatches, labels=labels)
             break
 
     # initialize the polyak-ema op if it exists
     if args.polyak_ema > 0:
         layers.polyak_ema_parameters(model, args.polyak_ema)
+
+    # cleanups
+    minibatches.clear()
+    labels.clear()
 
 
 def register_plots(loss, grapher, epoch, prefix='train'):
@@ -462,21 +467,29 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     assert optimizer is None if is_eval else optimizer is not None
     loss_map, num_samples = {}, 0
 
+    # cache a list of minibatches, since the memory model needs an episode
+    minibatches = []
+
     # iterate over data and labels
     for num_minibatches, (minibatch, labels) in enumerate(loader):
         minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
         labels = labels.cuda(non_blocking=True) if args.cuda else labels
 
+        # build an episode of minibatch samples
+        if len(minibatches) < args.episode_length:
+            minibatches.append(minibatch)
+            continue
+
         with torch.no_grad() if is_eval else utils.dummy_context():
             if is_eval and args.polyak_ema > 0:                                # use the Polyak model for predictions
                 pred_logits, reparam_map = layers.get_polyak_prediction(
-                    model, pred_fn=functools.partial(model, minibatch, labels=labels))
+                    model, pred_fn=functools.partial(model, minibatches, labels=labels))
             else:
-                pred_logits, reparam_map = model(minibatch, labels=labels)     # get normal predictions
+                pred_logits, reparam_map = model(minibatches, labels=labels)     # get normal predictions
 
             # compute loss
             loss_t = model.loss_function(recon_x=pred_logits,
-                                         x=minibatch,
+                                         x=minibatches,
                                          params=reparam_map,
                                          K=args.monte_carlo_posterior_samples)
             loss_map = loss_t if not loss_map else tree.map_structure(         # aggregate loss
@@ -489,7 +502,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
                 with amp.scale_loss(loss_t['loss_mean'], optimizer) as scaled_loss:
                     scaled_loss.backward()                                     # compute grads (fp16+fp32)
             else:
-                loss_t['loss_mean'].backward()                                 # compute grads (fp32)
+                loss_t['loss_mean'].backward(retain_graph=True)                # compute grads (fp32)
 
             if args.clip > 0:
                 # TODO: clip by value or norm? torch.nn.utils.clip_grad_value_
@@ -501,6 +514,12 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
                 layers.polyak_ema_parameters(model, args.polyak_ema)
 
             del loss_t
+
+        # clear the list to prevent OOM
+        minibatches_tensor = torch.cat(  # [B, T, C, H, W]
+            [xi.unsqueeze(1) for xi in minibatches], 1).contiguous()
+        minibatches_tensor = minibatches_tensor.view(-1, *minibatches_tensor.shape[-3:])  # fold into batch
+        minibatches.clear()
 
         if args.debug_step and num_minibatches > 1:  # for testing purposes
             break
@@ -528,38 +547,90 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         loss_map['ms_ssim_mean'] = metrics.compute_mssim(
             minibatch, reconstr_map['reconstruction_imgs'])
 
-    # gather scalar values of reparameterizers (if they exist)
-    reparam_scalars = model.get_reparameterizer_scalars()
-
     # plot the test accuracy, loss and images
-    register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
+    register_plots(loss_map, grapher, epoch=epoch, prefix=prefix)
 
-    # tack on images to grapher
-    image_map = {'input_imgs': minibatch}
+    # activate the logits of the reconstruction and get the dict
+    # also grab the memory images for visualization and the input images
+    reconstr_map = model.get_activated_reconstructions(pred_logits)
+    memory_imgs = model.get_images_from_reparam(reparam_map)
+    resize_shp = min(64, args.input_shape[-1])
+    input_images = {'input_imgs': F.interpolate(minibatches_tensor, size=(resize_shp, resize_shp))}
+
+    # tack on FID information if requested, do it in-frequently
+    if args.fid_server is not None:
+        post_remote_fid(epoch, model, grapher, prefix, post_every=23)
 
     # Add generations to our image dict
     with torch.no_grad():
-        prior_generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
-                                                           use_aggregate_posterior=False)
-        ema_generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
-                                                         use_aggregate_posterior=True)
-        image_map['prior_generated_imgs'] = prior_generated
-        image_map['ema_generated_imgs'] = ema_generated
+        generated_map = model.generate_synthetic_samples(
+            args.batch_size, memory_state=reparam_map['memory_state'])
 
-    register_images({**image_map, **reconstr_map}, grapher, epoch=epoch, prefix=prefix)
+    def reduce_num_images(image_dict, num_to_post):        # XXX: parameterize
+        for k in image_dict:
+            if 'generated' not in k:
+                image_dict[k] = image_dict[k][0:num_to_post]
+
+        return image_dict
+
+    image_map = reduce_num_images({**reconstr_map, **memory_imgs, **input_images, **generated_map}, 64)
+    register_images(image_map, grapher, epoch, prefix=prefix)
     if grapher is not None:
         grapher.save()
 
     # cleanups (see https://tinyurl.com/ycjre67m) + return ELBO for early stopping
     loss_val = tensor2item(loss_map['elbo_mean']) if args.vae_type != 'autoencoder' \
         else tensor2item(loss_map['nll_mean'])
-    for d in [loss_map, image_map, reparam_map, reparam_scalars]:
+    for d in [loss_map, image_map, reparam_map]:
         d.clear()
 
     del minibatch
     del labels
 
     return loss_val
+
+
+def post_remote_fid(epoch, model, grapher, prefix, post_every):
+    """Helper to request remote FID compute every post_every epoch.
+
+    :param epoch: the current epoch
+    :param model: the model
+    :param grapher: the grapher object
+    :param prefix: train / test / val
+    :param post_every: epoch interval to request fid calculation
+    :returns: nothing, checks file and posts fids
+    :rtype: None
+
+    """
+    assert hasattr(model, 'fid_client') and model.fid_client is not None, "FID client not created."
+    assert hasattr(model, 'test_images') and model.test_images is not None, "FID test images not setup."
+
+    # Compute the FID and save to a file in the log-dir
+    if epoch > 0 and epoch % post_every == 0:
+        with torch.no_grad():
+            num_batches_to_generate = int(np.ceil(10000. / args.episode_length))
+            fid_map = model.generate_synthetic_samples(num_batches_to_generate,
+                                                       reset_state=False,
+                                                       use_aggregate_posterior=False)
+
+            # select 10k and transpose the channel to the final dimension as required in TF
+            fid_map = tree.map_structure(lambda t: t[-10000:].transpose(1, -1), fid_map)
+
+            for k, v in fid_map.items():
+                # Build the lambda to post the images
+                def loss_lbda(fid_scalar, scalar_name, epoch, prefix):
+                    fid_scalar = np.float32(rpyc.classic.obtain(fid_scalar))
+                    fid_map = {'fid_' + scalar_name: fid_scalar}
+                    register_plots(fid_map, grapher, epoch=epoch, prefix=prefix, force_sync=True)
+
+                # POST the true data and the fake data.
+                scalar_name = k.replace('_imgs', '_mean')
+                lbda = functools.partial(loss_lbda, scalar_name=scalar_name, epoch=epoch, prefix=prefix)
+                fake_images = v.detach().cpu().numpy() if args.nll_type == 'bernoulli' \
+                    else np.round(v.detach().cpu().numpy())
+                model.fid_client.post_with_images(fake_images=fake_images,
+                                                  real_images=model.test_images,
+                                                  lbda=lbda)
 
 
 def train(epoch, model, optimizer, train_loader, grapher, prefix='train'):
