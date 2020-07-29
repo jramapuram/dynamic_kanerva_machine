@@ -129,11 +129,11 @@ class DynamicKanervaMachine(AbstractVAE):
 
         episode_length = self.config['episode_length']
         decoder = nn.Sequential(
-            layers.View([-1, self.config['code_size']]),
+            # layers.View([-1, self.config['code_size']]),
             layers.get_decoder(output_shape=dec_conf['input_shape'], **dec_conf)(
                 input_size=self.config['code_size']
             ),
-            layers.View([-1, episode_length, *self.input_shape]),
+            # layers.View([-1, episode_length, *self.input_shape]),
         )
 
         # append the variance as necessary
@@ -161,6 +161,18 @@ class DynamicKanervaMachine(AbstractVAE):
             # Fold in episode into batch and return for visualization.
             'generated_imgs': generated.view([-1, *generated.shape[-3:]])
         }
+
+    # def decode(self, z):
+    #     """ Decode a latent z back to x.
+
+    #     :param z: the latent tensor.
+    #     :returns: decoded logits (unactivated).
+    #     :rtype: torch.Tensor
+
+    #     """
+    #     z = z.contiguous()
+    #     decoded_logits = torch.cat([self.decoder(z[:, i, :]).unsqueeze(1) for i in range(z.shape[1])], 1)
+    #     return decoded_logits.contiguous()
 
     def encode(self, x):
         """ Encodes a tensor x to a set of logits.

@@ -97,7 +97,7 @@ def batch_fill_diag(matrix, vector):
     def _fill_diag(matrix, vector):
         """single matrix - vector solution"""
         diag = torch.diagonal(matrix)
-        eye = torch.eye(diag.shape[-1])
+        eye = torch.eye(diag.shape[-1], device=matrix.device)
         return (matrix - diag * eye) + vector * eye
 
     if matrix.dim() == 3:
@@ -149,26 +149,23 @@ class KanervaMemory(nn.Module):
         self._w_prior_stddev = w_prior_stddev
 
         # trainable std-deviation
-        log_w_stddev = nn.Parameter(torch.zeros(1) + np.log(0.3),
-                                    requires_grad=True)
-        if obs_noise_stddev > 0.0:
-            self._obs_noise_stddev = obs_noise_stddev  # constant
-        else:
-            log_obs_stddev = nn.Parameter(torch.zeros(1) + np.log(1.0),
+        self._log_w_stddev = nn.Parameter(torch.zeros(1) + np.log(0.3),
                                           requires_grad=True)
-            self._obs_noise_stddev = torch.exp(log_obs_stddev)
+        if obs_noise_stddev > 0.0:
+            self._obs_noise_stddev = nn.Parameter(torch.zeros(1) + np.log(obs_noise_stddev),
+                                                  requires_grad=False)  # constant
+        else:  # learned parameter
+            self._obs_noise_stddev = nn.Parameter(torch.zeros(1), requires_grad=True)
 
-        self._w_stddev = torch.exp(log_w_stddev)
-        self._w_prior_dist = dist.MultivariateNormal(
-          loc=torch.zeros([self._memory_size]),
-          covariance_matrix=self._w_prior_stddev * torch.eye(self._memory_size)
-        )
-        self._prior_log_var = nn.Parameter(torch.zeros(1) + np.log(1.0),
-                                           requires_grad=True)
-        self._prior_mean = nn.Parameter(nn.init.normal_(torch.zeros([self._memory_size, self._code_size])))
+        self._prior_log_var = nn.Parameter(torch.zeros(1), requires_grad=True)
+        self._prior_mean = nn.Parameter(nn.init.trunc_normal_(
+            torch.zeros([self._memory_size, self._code_size])), requires_grad=True)
 
     def _get_w_dist(self, mu_w):
-        cov = self._w_stddev * torch.eye(self._memory_size, dtype=mu_w.dtype)
+        w_stddev = torch.exp(self._log_w_stddev)
+        cov = w_stddev * torch.eye(self._memory_size,
+                                   dtype=mu_w.dtype,
+                                   device=mu_w.device)
         return dist.MultivariateNormal(
           loc=mu_w, covariance_matrix=cov)
 
@@ -181,7 +178,16 @@ class KanervaMemory(nn.Module):
         Returns:
           w: [batch_size, memory_size]
         """
-        return self._w_prior_dist.rsample([seq_length, batch_size])
+        w_stddev = torch.exp(self._log_w_stddev)
+        eye = torch.eye(self._memory_size,
+                        dtype=w_stddev.dtype,
+                        device=w_stddev.device)
+        cov = self._w_prior_stddev * eye
+        loc = torch.zeros([self._memory_size],
+                          dtype=w_stddev.dtype,
+                          device=w_stddev.device)
+        return dist.MultivariateNormal(
+          loc=loc, covariance_matrix=cov).rsample([seq_length, batch_size])
 
     def read_with_z(self, z, memory_state):
         """Query from memory (specified by memory_state) using embedding z.
@@ -204,7 +210,9 @@ class KanervaMemory(nn.Module):
 
     def wrap_z_dist(self, z_mean):
         """Wrap the mean of z as an observation (Gaussian) distribution."""
-        cov = self._obs_noise_stddev * torch.eye(self._memory_size, dtype=z_mean.dtype)
+        cov = torch.exp(self._obs_noise_stddev) * torch.eye(self._memory_size,
+                                                            dtype=z_mean.dtype,
+                                                            device=z_mean.device)
         return dist.MultivariateNormal(
           loc=z_mean, covariance_matrix=cov)
 
@@ -266,7 +274,7 @@ class KanervaMemory(nn.Module):
 
         delta = new_z_mean - self.get_w_to_z_mean(w_samples, memory_state.M_mean)
         _, wUw = self._read_cov(w_samples, memory_state)
-        var_z = wUw + new_z_var + self._obs_noise_stddev**2
+        var_z = wUw + new_z_var + torch.exp(self._obs_noise_stddev)**2
         beta = wUw / var_z
 
         dkl_M = -0.5 * (self._code_size * beta
@@ -278,7 +286,8 @@ class KanervaMemory(nn.Module):
 
     def _get_prior_params(self):
         self._prior_var = torch.ones([self._memory_size],
-                                     dtype=self._w_stddev.dtype) * torch.exp(self._prior_log_var) + EPSILON
+                                     dtype=self._prior_log_var.dtype,
+                                     device=self._prior_log_var.device) * torch.exp(self._prior_log_var) + EPSILON
         prior_cov = torch.diag(self._prior_var)
         return self._prior_mean, prior_cov
 
@@ -295,7 +304,7 @@ class KanervaMemory(nn.Module):
         # w_matrix = torch.Size([160, 160])
         # print('M = {} | new_z_mean = {} | w_matrix = {}'.format(M.shape, new_z_mean.shape, w_matrix.shape))
         w_rhs = torch.einsum('bmc,sbc->bms', M, new_z_mean)
-        w_mean = lstsq(w_matrix, w_rhs, self._obs_noise_stddev**2 / self._w_prior_stddev**2)
+        w_mean = lstsq(w_matrix, w_rhs, torch.exp(self._obs_noise_stddev)**2 / self._w_prior_stddev**2)
         # print('w_mean = ', w_mean.shape)
         w_mean = torch.einsum('bms->sbm', w_mean)
         return w_mean
@@ -375,7 +384,7 @@ class KanervaMemory(nn.Module):
         old_mean, old_cov = old_memory
         wR = self.get_w_to_z_mean(w_samples, old_memory.M_mean)
         wU, wUw = self._read_cov(w_samples, old_memory)
-        sigma_z = wUw + new_z_var + self._obs_noise_stddev**2  # [S, B]
+        sigma_z = wUw + new_z_var + torch.exp(self._obs_noise_stddev)**2  # [S, B]
         delta = new_z_mean - wR  # [S, B, C]
         c_z = wU / sigma_z.unsqueeze(-1)  # [S, B, M]
         posterior_mean = old_mean + torch.einsum('sbm,sbc->bmc', c_z, delta)
@@ -395,7 +404,19 @@ class KanervaMemory(nn.Module):
     def get_dkl_w(self, w_mean):
         """Return the KL-divergence between posterior and prior weights w."""
         posterior_dist = self._get_w_dist(w_mean)
-        dkl_w = dist.kl_divergence(posterior_dist, self._w_prior_dist)
+
+        # Build the prior distribution
+        prior_loc = torch.zeros([self._memory_size],
+                                dtype=w_mean.dtype,
+                                device=w_mean.device)
+        eye = torch.eye(self._memory_size,
+                        dtype=w_mean.dtype,
+                        device=w_mean.device)
+        prior_cov = self._w_prior_stddev * eye
+        w_prior_dist = dist.MultivariateNormal(loc=prior_loc, covariance_matrix=prior_cov)
+
+        # use torch distributions to take the KLD
+        dkl_w = dist.kl_divergence(posterior_dist, w_prior_dist)
         assert dkl_w.shape == w_mean.shape[:-1]
         return dkl_w
 
