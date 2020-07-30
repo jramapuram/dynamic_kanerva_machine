@@ -129,11 +129,11 @@ class DynamicKanervaMachine(AbstractVAE):
 
         episode_length = self.config['episode_length']
         decoder = nn.Sequential(
-            # layers.View([-1, self.config['code_size']]),
+            layers.View([-1, self.config['code_size']]),
             layers.get_decoder(output_shape=dec_conf['input_shape'], **dec_conf)(
                 input_size=self.config['code_size']
             ),
-            # layers.View([-1, episode_length, *self.input_shape]),
+            layers.View([-1, episode_length, *self.input_shape]),
         )
 
         # append the variance as necessary
