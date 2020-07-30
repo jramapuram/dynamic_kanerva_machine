@@ -6,10 +6,10 @@ Ported from the [tensorflow / sonnet implementation](https://github.com/deepmind
 
 ## Setup
 
-Clone the repo **WITH** the submodules. If you get an error about permissions setup your [github key](https://docs.github.com/en/enterprise/2.15/user/articles/adding-a-new-ssh-key-to-your-github-account)
+Clone the repo **WITH** the submodules. If you get an error about permissions setup your [github key](https://docs.github.com/en/enterprise/2.15/user/articles/adding-a-new-ssh-key-to-your-github-account).
 
 ``` bash
-git clone --recursive git+ssh://git@github.com/jramapuram/dynamic_kanerva_machine.git     # clone the repo WITH submodules
+git clone --recursive git+ssh://git@github.com/jramapuram/dynamic_kanerva_machine.git
 ```
 
 The dependencies are fully captured in a docker container:
