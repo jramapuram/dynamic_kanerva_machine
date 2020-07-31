@@ -162,18 +162,6 @@ class DynamicKanervaMachine(AbstractVAE):
             'generated_imgs': generated.view([-1, *generated.shape[-3:]])
         }
 
-    # def decode(self, z):
-    #     """ Decode a latent z back to x.
-
-    #     :param z: the latent tensor.
-    #     :returns: decoded logits (unactivated).
-    #     :rtype: torch.Tensor
-
-    #     """
-    #     z = z.contiguous()
-    #     decoded_logits = torch.cat([self.decoder(z[:, i, :]).unsqueeze(1) for i in range(z.shape[1])], 1)
-    #     return decoded_logits.contiguous()
-
     def encode(self, x):
         """ Encodes a tensor x to a set of logits.
 
@@ -202,6 +190,7 @@ class DynamicKanervaMachine(AbstractVAE):
         """
         inputs = torch.cat([i.unsqueeze(1) for i in x], 1)              # expand to [B, T, C, W, H]
         batch_size = inputs.shape[0]
+        episode_size = inputs.shape[1]
         z_episode = self.encode(inputs)                                 # [B, T, F] base logits.
 
         # Project the episode logits to write and read logits
@@ -218,10 +207,10 @@ class DynamicKanervaMachine(AbstractVAE):
                                                 posterior_memory)               # dkl_r: [T, B]
         dkl_M = self.memory.get_dkl_total(posterior_memory)                     # dkl_M: [T, B]
 
-        return read_z, {
-            'memory_kl': dkl_M,
-            'read_kl': dkl_r,
-            'write_kl': dkl_w,
+        return read_z.tranpose(0, 1), {                                         # [B, T, code_size]
+            'memory_kl': dkl_M / episode_size,
+            'read_kl': dkl_r / episode_size,
+            'write_kl': dkl_w / episode_size,
 
             # We need an actual updated memory to generate samples.
             'memory_state': posterior_memory,
