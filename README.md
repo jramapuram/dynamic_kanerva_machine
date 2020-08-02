@@ -18,6 +18,12 @@ The dependencies are fully captured in a docker container:
 docker pull jramapuram/pytorch:1.6.0-cuda10.1
 ```
 
+If you want to setup your own environment use:
+
+  - environment.yml (conda) in addition to
+  - requirements.txt (pip)
+
+
 #### Usage Binarized MNIST
 
 ``` bash
