@@ -1,6 +1,5 @@
 import os
 import time
-import rpyc
 import tree
 import argparse
 import functools
@@ -23,8 +22,9 @@ import optimizers.scheduler as scheduler
 
 from models.dkm import DynamicKanervaMachine
 from datasets.loader import get_loader
+from datasets.utils import get_numpy_dataset
 from helpers.grapher import Grapher
-from helpers.fid_client import FIDClient
+from helpers.metrics_client import MetricsClient
 from optimizers.lars import LARS
 
 
@@ -121,8 +121,8 @@ parser.add_argument('--add-img-noise', action='store_true', default=False,
 # Metrics
 parser.add_argument('--calculate-msssim', action='store_true', default=False,
                     help='enables MS-SSIM (default: False)')
-parser.add_argument('--fid-server', type=str, default=None,
-                    help='fid server url with port;  eg: myhost:8000 (default: None)')
+parser.add_argument('--metrics-server', type=str, default=None,
+                    help='remote metrics server url with port;  eg: myhost:8000 (default: None)')
 
 # Optimization related
 parser.add_argument('--lr', type=float, default=4e-4, metavar='LR',
@@ -327,6 +327,16 @@ def build_loader_model_grapher(args):
         utils.number_of_parameters(network) / 1e6
     ))
 
+    # add the test set as a np array for metrics calc
+    if args.metrics_server is not None:
+        network.test_images = get_numpy_dataset(task=args.task,
+                                                data_dir=args.data_dir,
+                                                test_transform=test_transform,
+                                                split='test',
+                                                image_size=args.image_size_override,
+                                                cuda=args.cuda)
+        print("Metrics test images: ", network.test_images.shape)
+
     # build the grapher object
     grapher = None
     if args.visdom_url is not None and args.distributed_rank == 0:
@@ -385,13 +395,14 @@ def lazy_generate_modules(model, loader):
     labels.clear()
 
 
-def register_plots(loss, grapher, epoch, prefix='train'):
+def register_plots(loss, grapher, epoch, prefix='train', force_sync=False):
     """ Registers line plots with grapher.
 
     :param loss: the dict containing '*_mean' or '*_scalar' values
     :param grapher: the grapher object
     :param epoch: the current epoch
     :param prefix: prefix to append to the plot
+    :param force_sync: force a sync function call
     :returns: None
     :rtype: None
 
@@ -404,7 +415,10 @@ def register_plots(loss, grapher, epoch, prefix='train'):
             if 'mean' in k or 'scalar' in k:
                 key_name = '-'.join(k.split('_')[0:-1])
                 value = v.item() if not isinstance(v, (float, np.float32, np.float64)) else v
-                grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
+                if force_sync:
+                    grapher.sync_add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
+                else:
+                    grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
 
 
 def register_images(output_map, grapher, epoch, prefix='train'):
@@ -557,9 +571,11 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     resize_shp = min(64, args.input_shape[-1])
     input_images = {'input_imgs': F.interpolate(minibatches_tensor, size=(resize_shp, resize_shp))}
 
-    # tack on FID information if requested, do it in-frequently
-    if args.fid_server is not None:
-        post_remote_fid(epoch, model, grapher, prefix, post_every=23)
+    # tack on remote metrics information if requested; do it in-frequently
+    if args.metrics_server is not None and not is_eval:  # only eval train generations due to BN
+        request_remote_metrics_calc(epoch, model, grapher, prefix,
+                                    memory_state=reparam_map['memory_state'],
+                                    post_every=20)
 
     # Add generations to our image dict
     with torch.no_grad():
@@ -590,45 +606,41 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     return loss_val
 
 
-def post_remote_fid(epoch, model, grapher, prefix, post_every):
-    """Helper to request remote FID compute every post_every epoch.
+def request_remote_metrics_calc(epoch, model, grapher, prefix, memory_state, post_every):
+    """Helper to request remote server to compute metrics every post_every epoch.
 
     :param epoch: the current epoch
     :param model: the model
     :param grapher: the grapher object
     :param prefix: train / test / val
-    :param post_every: epoch interval to request fid calculation
-    :returns: nothing, checks file and posts fids
+    :param memory_state: the memory state tuple
+    :param post_every: epoch interval to request metrics calculation
+    :returns: nothing, asynchronously calls back the lbda function when complete
     :rtype: None
 
     """
-    assert hasattr(model, 'fid_client') and model.fid_client is not None, "FID client not created."
-    assert hasattr(model, 'test_images') and model.test_images is not None, "FID test images not setup."
+    assert hasattr(model, 'metrics_client') and model.metrics_client is not None, "Metrics client not created."
+    assert hasattr(model, 'test_images') and model.test_images is not None, "Metrics test images not setup."
 
-    # Compute the FID and save to a file in the log-dir
+    # Generate samples and post to the remote server
     if epoch > 0 and epoch % post_every == 0:
         with torch.no_grad():
             num_batches_to_generate = int(np.ceil(10000. / args.episode_length))
-            fid_map = model.generate_synthetic_samples(num_batches_to_generate,
-                                                       reset_state=False,
-                                                       use_aggregate_posterior=False)
+            generated_map = model.generate_synthetic_samples(num_batches_to_generate,
+                                                             memory_state=memory_state)
+            generated_imgs = generated_map['generated_imgs'].transpose(1, -1)[-10000:]
+            assert generated_imgs.shape[0] == 10000, "need 10k generations for metrics, got {}.".format(
+                generated_imgs.shape)
 
-            # select 10k and transpose the channel to the final dimension as required in TF
-            fid_map = tree.map_structure(lambda t: t[-10000:].transpose(1, -1), fid_map)
+            # Build the lambda to post the images
+            def loss_lbda(metrics_map, epoch, prefix):
+                register_plots(metrics_map, grapher, epoch=epoch, prefix=prefix, force_sync=True)
 
-            for k, v in fid_map.items():
-                # Build the lambda to post the images
-                def loss_lbda(fid_scalar, scalar_name, epoch, prefix):
-                    fid_scalar = np.float32(rpyc.classic.obtain(fid_scalar))
-                    fid_map = {'fid_' + scalar_name: fid_scalar}
-                    register_plots(fid_map, grapher, epoch=epoch, prefix=prefix, force_sync=True)
-
-                # POST the true data and the fake data.
-                scalar_name = k.replace('_imgs', '_mean')
-                lbda = functools.partial(loss_lbda, scalar_name=scalar_name, epoch=epoch, prefix=prefix)
-                fake_images = v.detach().cpu().numpy() if args.nll_type == 'bernoulli' \
-                    else np.round(v.detach().cpu().numpy())
-                model.fid_client.post_with_images(fake_images=fake_images,
+            # POST the true data and the fake data.
+            lbda = functools.partial(loss_lbda, epoch=epoch, prefix=prefix)
+            fake_images = generated_imgs.detach().cpu().numpy() if 'binarized' not in args.task \
+                else np.round(generated_imgs.detach().cpu().numpy())
+            model.metrics_client.post_with_images(fake_images=fake_images,
                                                   real_images=model.test_images,
                                                   lbda=lbda)
 
@@ -723,10 +735,10 @@ def run(rank, args):
     restore_dict = saver.restore()
     init_epoch = restore_dict['epoch']
 
-    # add the the fid model if requested
-    if args.fid_server is not None:
-        model.fid_client = FIDClient(host=args.fid_server.split(':')[0],
-                                     port=args.fid_server.split(':')[1])
+    # add the the metrics client to the model if requested
+    if args.metrics_server is not None:
+        model.metrics_client = MetricsClient(host=args.metrics_server.split(':')[0],
+                                             port=args.metrics_server.split(':')[1])
 
     # main training loop
     for epoch in range(init_epoch, args.epochs + 1):
@@ -782,3 +794,7 @@ if __name__ == "__main__":
     else:
         # Non-distributed launch
         run(rank=0, args=args)
+
+    if args.metrics_server is not None:
+        print("training complete! sleeping for 60 min for remote metrics to complete...")
+        time.sleep(60 * 60)

@@ -5,7 +5,7 @@ import numpy as np
 import torch.nn as nn
 
 import helpers.layers as layers
-from models.memory import KanervaMemory
+from models.memory import KanervaMemory, MemoryState
 from models.vae.abstract_vae import AbstractVAE
 # from models.vae.reparameterizers import get_reparameterizer
 
@@ -140,6 +140,29 @@ class DynamicKanervaMachine(AbstractVAE):
         decoder = self._append_variance_projection(decoder)
         return torch.jit.script(decoder) if self.config['jit'] else decoder
 
+    def _expand_memory(self, memory, batch_size):
+        """Internal helper to expand the memory view for the ST
+
+        :param key: the indexing key: [B*T*NR, 3]
+        :returns: an expanded view of the memory
+        :rtype: torch.Tensor
+
+        """
+        def _expand_mean_or_cov(memory):
+            if memory.shape[0] >= batch_size:
+                # Base case where we don't need to expand.
+                # Useful for generations of less than batch_size.
+                return memory[0:batch_size]
+
+            expand_count = int(np.ceil(batch_size / float(memory.shape[0])))  # expand by NR
+            expanded_memory_shape = [-1] + list(memory.shape[1:])
+            expanded_memory = memory.unsqueeze(1).expand(  # [B, MS, WS] -> [B, NR, MS, WS]
+                -1, expand_count, -1, -1).contiguous().view(expanded_memory_shape)  # [-1, MS, WS]
+            return expanded_memory[0:batch_size]
+
+        return MemoryState(M_mean=_expand_mean_or_cov(memory.M_mean),
+                           M_cov=_expand_mean_or_cov(memory.M_cov))
+
     def generate_synthetic_samples(self, batch_size, memory_state, **kwargs):
         """ Generates samples with VAE.
 
@@ -149,6 +172,9 @@ class DynamicKanervaMachine(AbstractVAE):
         :rtype: torch.Tensor
 
         """
+        # expand the memory if needed
+        memory_state = self._expand_memory(memory_state, batch_size)
+
         episode_length = self.config['episode_length']
         w_samples = self.memory.sample_prior_w(seq_length=episode_length,
                                                batch_size=batch_size)
@@ -207,7 +233,7 @@ class DynamicKanervaMachine(AbstractVAE):
                                                 posterior_memory)               # dkl_r: [T, B]
         dkl_M = self.memory.get_dkl_total(posterior_memory)                     # dkl_M: [T, B]
 
-        return read_z.tranpose(0, 1), {                                         # [B, T, code_size]
+        return read_z.transpose(0, 1), {                                         # [B, T, code_size]
             'memory_kl': dkl_M / episode_size,
             'read_kl': dkl_r / episode_size,
             'write_kl': dkl_w / episode_size,
