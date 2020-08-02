@@ -1,6 +1,6 @@
 # Dynamic Kanerva Machine (DKM) Pytorch
 
-An implementation of Dynamic Kanerva Machines in pytorch.  
+An (unofficial) implementation of Dynamic Kanerva Machines in pytorch.  
 Ported from the [tensorflow / sonnet implementation](https://github.com/deepmind/dynamic-kanerva-machines).
 
 
@@ -20,8 +20,20 @@ docker pull jramapuram/pytorch:1.6.0-cuda10.1
 
 #### Usage Binarized MNIST
 
-Change the transforms in `supervised_main.py` appropriately for cifar10 and:
-
 ``` bash
 sh docker/run.sh "python main.py" 0  # tailing 0 runs on cuda device 0
+```
+
+#### Citation
+
+Cite the original authors on doing some great work:
+
+```
+@inproceedings{wu2018learning,
+  title={Learning attractor dynamics for generative memory},
+  author={Wu, Yan and Wayne, Gregory and Gregor, Karol and Lillicrap, Timothy},
+  booktitle={Advances in Neural Information Processing Systems},
+  pages={9379--9388},
+  year={2018}
+}
 ```
