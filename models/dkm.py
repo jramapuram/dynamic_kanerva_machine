@@ -172,21 +172,22 @@ class DynamicKanervaMachine(AbstractVAE):
         :rtype: torch.Tensor
 
         """
-        # expand the memory if needed
-        memory_state = self._expand_memory(memory_state, batch_size)
+        with torch.no_grad():
+            # expand the memory if needed
+            memory_state = self._expand_memory(memory_state, batch_size)
 
-        episode_length = self.config['episode_length']
-        w_samples = self.memory.sample_prior_w(seq_length=episode_length,
-                                               batch_size=batch_size)
-        z_samples = self.memory.get_w_to_z_mean(w_samples, memory_state.M_mean)
-        z_read, _ = self.memory.read_with_z(z=z_samples, memory_state=memory_state)
+            episode_length = self.config['episode_length']
+            w_samples = self.memory.sample_prior_w(seq_length=episode_length,
+                                                   batch_size=batch_size)
+            z_samples = self.memory.get_w_to_z_mean(w_samples, memory_state.M_mean)
+            z_read, _ = self.memory.read_with_z(z=z_samples, memory_state=memory_state)
 
-        # Decode the read samples & return
-        generated = self.nll_activation(self.decode(z_read))
-        return {
-            # Fold in episode into batch and return for visualization.
-            'generated_imgs': generated.view([-1, *generated.shape[-3:]])
-        }
+            # Decode the read samples & return
+            generated = self.nll_activation(self.decode(z_read))
+            return {
+                # Fold in episode into batch and return for visualization.
+                'generated_imgs': generated.view([-1, *generated.shape[-3:]])
+            }
 
     def encode(self, x):
         """ Encodes a tensor x to a set of logits.
