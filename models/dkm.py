@@ -29,7 +29,10 @@ class DynamicKanervaMachine(AbstractVAE):
 
         # Build the Kanerva memory
         self.memory = KanervaMemory(code_size=self.config['code_size'],
-                                    memory_size=self.config['memory_size'])
+                                    memory_size=self.config['memory_size'],
+                                    num_opt_iters=self.config['num_opt_iters'],
+                                    sample_w=self.config['sample_w'],
+                                    sample_M=self.config['sample_memory'])
 
         # Projections from embedding to write and reads
         self.write_projector = self._build_dense(input_size=self.config['latent_size'],
@@ -60,18 +63,18 @@ class DynamicKanervaMachine(AbstractVAE):
 
         """
         # Following for standard 2d image decoders:
-        # enc_conf = deepcopy(self.config)
-        # enc_conf['encoder_layer_type'] = 'resnet50'
-        # return nn.Sequential(
-        #     layers.View([-1, *self.input_shape]),                                         # fold in: [T*B, C, H, W]
-        #     # layers.get_encoder(**self.config)(
-        #     #     output_size=self.config['latent_size']
-        #     # ),
-        #     layers.get_torchvision_encoder(**enc_conf)(
-        #         output_size=self.config['latent_size'],
-        #     ),
-        #     layers.View([-1, self.config['episode_length'], self.config['latent_size']])  # un-fold episode to [T, B, F]
-        # )
+        enc_conf = deepcopy(self.config)
+        enc_conf['encoder_layer_type'] = 'resnet50'
+        encoder = nn.Sequential(
+            layers.View([-1, *self.input_shape]),                                         # fold in: [T*B, C, H, W]
+            # layers.get_encoder(**self.config)(
+            #     output_size=self.config['latent_size']
+            # ),
+            layers.get_torchvision_encoder(**enc_conf)(
+                output_size=self.config['latent_size'],
+            ),
+            layers.View([-1, self.config['episode_length'], self.config['latent_size']])  # un-fold episode to [T, B, F]
+        )
 
         # encoder = layers.S3DEncoder(
         #     output_size=self.config['latent_size'],
@@ -84,35 +87,35 @@ class DynamicKanervaMachine(AbstractVAE):
         #     pretrained=False
         # )
 
-        import torchvision
-        encoder = layers.TSMResnetEncoder(
-            pretrained_output_size=512,
-            output_size=self.config['latent_size'],
-            latent_size=self.config['latent_size'],
-            activation_str=self.config['encoder_activation'],
-            conv_normalization_str=self.config['conv_normalization'],
-            dense_normalization_str=self.config['dense_normalization'],
-            norm_first_layer=True,
-            norm_last_layer=False,
-            layer_fn=torchvision.models.resnet18,
-            pretrained=False,
-            num_segments=1,  # self.config['episode_length'],
-            shift_div=self.config['shift_div'],
-            temporal_pool=False
-        )
-        if self.config['encoder_layer_modifier'] == 'sine':
-            layers.convert_layer(encoder.model,                 # remove BN
-                                 from_layer=nn.BatchNorm2d,
-                                 to_layer=layers.Identity,
-                                 set_from_layer_kwargs=False)
-            layers.convert_layer(encoder.model,                 # remove ReLU
-                                 from_layer=nn.ReLU,
-                                 to_layer=layers.Identity,
-                                 set_from_layer_kwargs=False)
-            layers.convert_layer(encoder.model,                 # replace Conv2d --> SineConv2d
-                                 from_layer=nn.Conv2d,
-                                 to_layer=layers.SineConv2d,
-                                 set_from_layer_kwargs=True)
+        # import torchvision
+        # encoder = layers.TSMResnetEncoder(
+        #     pretrained_output_size=512,
+        #     output_size=self.config['latent_size'],
+        #     latent_size=self.config['latent_size'],
+        #     activation_str=self.config['encoder_activation'],
+        #     conv_normalization_str=self.config['conv_normalization'],
+        #     dense_normalization_str=self.config['dense_normalization'],
+        #     norm_first_layer=True,
+        #     norm_last_layer=False,
+        #     layer_fn=torchvision.models.resnet18,
+        #     pretrained=False,
+        #     num_segments=1,  # self.config['episode_length'],
+        #     shift_div=self.config['shift_div'],
+        #     temporal_pool=False
+        # )
+        # if self.config['encoder_layer_modifier'] == 'sine':
+        #     layers.convert_layer(encoder.model,                 # remove BN
+        #                          from_layer=nn.BatchNorm2d,
+        #                          to_layer=layers.Identity,
+        #                          set_from_layer_kwargs=False)
+        #     layers.convert_layer(encoder.model,                 # remove ReLU
+        #                          from_layer=nn.ReLU,
+        #                          to_layer=layers.Identity,
+        #                          set_from_layer_kwargs=False)
+        #     layers.convert_layer(encoder.model,                 # replace Conv2d --> SineConv2d
+        #                          from_layer=nn.Conv2d,
+        #                          to_layer=layers.SineConv2d,
+        #                          set_from_layer_kwargs=True)
 
         return encoder
 
@@ -197,9 +200,9 @@ class DynamicKanervaMachine(AbstractVAE):
         :rtype: torch.Tensor
 
         """
-        # encoded = self.encoder(x)                              # Standard (non-temporal) encoder
+        encoded = self.encoder(x)                              # Standard (non-temporal) encoder
         # encoded = self.encoder(x, reduction='mean').squeeze()  # S3D with pooling
-        encoded = self.encoder(x, reduction='none')              # TSM (no pooling)
+        # encoded = self.encoder(x, reduction='none')              # TSM (no pooling)
         if encoded.dim() < 2:
             return encoded.unsqueeze(-1)
 
@@ -221,7 +224,7 @@ class DynamicKanervaMachine(AbstractVAE):
         z_episode = self.encode(inputs)                                 # [B, T, F] base logits.
 
         # Project the episode logits to write and read logits
-        read_logits = self.read_projector(z_episode).transpose(0, 1)    # [T, B, code_size] for DKM
+        # read_logits = self.read_projector(z_episode).transpose(0, 1)    # [T, B, code_size] for DKM
         write_logits = self.write_projector(z_episode).transpose(0, 1)  # [T, B, code_size] for DKM
 
         # Grab the prior and update it to the posterior given the episode
@@ -230,7 +233,8 @@ class DynamicKanervaMachine(AbstractVAE):
                                                                  prior_memory)  # dkl_w: [T, B]
 
         # Read from the memory & compute the total KL penalty
-        read_z, dkl_r = self.memory.read_with_z(read_logits,                    # read_z: [T, B, code_size]
+        # read_z, dkl_r = self.memory.read_with_z(read_logits,                    # read_z: [T, B, code_size]
+        read_z, dkl_r = self.memory.read_with_z(write_logits,                   # read_z: [T, B, code_size]
                                                 posterior_memory)               # dkl_r: [T, B]
         dkl_M = self.memory.get_dkl_total(posterior_memory)                     # dkl_M: [T, B]
 

@@ -97,6 +97,12 @@ parser.add_argument('--model-dir', type=str, default='.models',
 # Temporal encoder / memory related
 parser.add_argument('--shift-div', type=int, default=8,
                     help='shift div becomes (1/shift_div) in TSM encoder (default: 8)')
+parser.add_argument('--sample-memory', action='store_true', default=False,
+                    help='enables memory sampling vs. using mean (default: False)')
+parser.add_argument('--sample-w', action='store_true', default=False,
+                    help='enables sampling the addressing vector w (default: False)')
+parser.add_argument('--num-opt-iters', type=int, default=10,
+                    help='number of optimization iterations for w and M (default: 10)')
 parser.add_argument('--code-size', type=int, default=100,
                     help='code size for memory operations (default: 100)')
 parser.add_argument('--memory-size', type=int, default=32,
