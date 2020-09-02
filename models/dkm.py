@@ -7,7 +7,7 @@ import torch.nn as nn
 import helpers.layers as layers
 from models.memory import KanervaMemory, MemoryState
 from models.vae.abstract_vae import AbstractVAE
-# from models.vae.reparameterizers import get_reparameterizer
+import helpers.distributions as distributions
 
 
 class DynamicKanervaMachine(AbstractVAE):
@@ -35,10 +35,10 @@ class DynamicKanervaMachine(AbstractVAE):
                                     sample_M=self.config['sample_memory'])
 
         # Projections from embedding to write and reads
-        self.write_projector = self._build_dense(input_size=self.config['latent_size'],
+        self.write_projector = self._build_dense(input_size=self.config['code_size'],  # self.config['latent_size'],
                                                  output_size=self.config['code_size'],
                                                  name='write')
-        self.read_projector = self._build_dense(input_size=self.config['latent_size'],
+        self.read_projector = self._build_dense(input_size=self.config['code_size'],  # self.config['latent_size'],
                                                 output_size=self.config['code_size'],
                                                 name='read')
 
@@ -64,16 +64,18 @@ class DynamicKanervaMachine(AbstractVAE):
         """
         # Following for standard 2d image decoders:
         enc_conf = deepcopy(self.config)
-        enc_conf['encoder_layer_type'] = 'resnet50'
+        # enc_conf['encoder_layer_type'] = 'resnet50'
         encoder = nn.Sequential(
             layers.View([-1, *self.input_shape]),                                         # fold in: [T*B, C, H, W]
-            # layers.get_encoder(**self.config)(
-            #     output_size=self.config['latent_size']
-            # ),
-            layers.get_torchvision_encoder(**enc_conf)(
-                output_size=self.config['latent_size'],
+            layers.get_encoder(**self.config)(
+                output_size=self.config['code_size']
             ),
-            layers.View([-1, self.config['episode_length'], self.config['latent_size']])  # un-fold episode to [T, B, F]
+            # layers.get_torchvision_encoder(**enc_conf)(
+            #     # output_size=self.config['latent_size'],
+            #     output_size=self.config['code_size']
+            # ),
+            layers.View([-1, self.config['episode_length'], self.config['code_size']])  # un-fold episode to [T, B, F]
+            # layers.View([-1, self.config['episode_length'], self.config['latent_size']])  # un-fold episode to [T, B, F]
         )
 
         # encoder = layers.S3DEncoder(
@@ -166,6 +168,20 @@ class DynamicKanervaMachine(AbstractVAE):
         return MemoryState(M_mean=_expand_mean_or_cov(memory.M_mean),
                            M_cov=_expand_mean_or_cov(memory.M_cov))
 
+    def _attractor_loop(self, inputs, posterior_memory):
+        """Runs the encode -> decode loop without doing a memory posterior update.
+
+        :param inputs: the inputs [B, T, C, W, H]
+        :param posterior_memory:
+        :returns:
+        :rtype:
+
+        """
+        z_episode = self.encode(inputs)                                 # [B, T, F] base logits.
+        read_z, _ = self.memory.read_with_z(z_episode.transpose(0, 1),  # read_z: [T, B, code_size]
+                                            posterior_memory)
+        return self.nll_activation(self.decode(read_z))
+
     def generate_synthetic_samples(self, batch_size, memory_state, **kwargs):
         """ Generates samples with VAE.
 
@@ -177,7 +193,7 @@ class DynamicKanervaMachine(AbstractVAE):
         """
         with torch.no_grad():
             # expand the memory if needed
-            memory_state = self._expand_memory(memory_state, batch_size)
+            memory_state = self._expand_memory(memory_state, batch_size)  # TODO(jramapuram): maybe issue here.
 
             episode_length = self.config['episode_length']
             w_samples = self.memory.sample_prior_w(seq_length=episode_length,
@@ -186,10 +202,16 @@ class DynamicKanervaMachine(AbstractVAE):
             z_read, _ = self.memory.read_with_z(z=z_samples, memory_state=memory_state)
 
             # Decode the read samples & return
-            generated = self.nll_activation(self.decode(z_read))
+            generations = [self.nll_activation(self.decode(z_read))]
+
+            # do the attractor cleanup iterations
+            for _ in range(self.config['attractor_cleanup_interations']):
+                generations.append(self._attractor_loop(generations[-1], memory_state))
+
+            generations = torch.cat(generations, 0)
             return {
                 # Fold in episode into batch and return for visualization.
-                'generated_imgs': generated.view([-1, *generated.shape[-3:]])
+                'generated_imgs': generations.view([-1, *generations.shape[-3:]])
             }
 
     def encode(self, x):
@@ -224,17 +246,18 @@ class DynamicKanervaMachine(AbstractVAE):
         z_episode = self.encode(inputs)                                 # [B, T, F] base logits.
 
         # Project the episode logits to write and read logits
-        # read_logits = self.read_projector(z_episode).transpose(0, 1)    # [T, B, code_size] for DKM
+        read_logits = self.read_projector(z_episode).transpose(0, 1)    # [T, B, code_size] for DKM
         write_logits = self.write_projector(z_episode).transpose(0, 1)  # [T, B, code_size] for DKM
 
         # Grab the prior and update it to the posterior given the episode
         prior_memory = self.memory.get_prior_state(batch_size)
+        # posterior_memory, _, dkl_w, _ = self.memory.update_state(z_episode.transpose(0, 1),
         posterior_memory, _, dkl_w, _ = self.memory.update_state(write_logits,
                                                                  prior_memory)  # dkl_w: [T, B]
 
         # Read from the memory & compute the total KL penalty
-        # read_z, dkl_r = self.memory.read_with_z(read_logits,                    # read_z: [T, B, code_size]
-        read_z, dkl_r = self.memory.read_with_z(write_logits,                   # read_z: [T, B, code_size]
+        # read_z, dkl_r = self.memory.read_with_z(z_episode.transpose(0, 1),      # read_z: [T, B, code_size]
+        read_z, dkl_r = self.memory.read_with_z(read_logits,
                                                 posterior_memory)               # dkl_r: [T, B]
         dkl_M = self.memory.get_dkl_total(posterior_memory)                     # dkl_M: [T, B]
 
@@ -245,6 +268,10 @@ class DynamicKanervaMachine(AbstractVAE):
 
             # We need an actual updated memory to generate samples.
             'memory_state': posterior_memory,
+
+            # track the episode to add for the AE loss
+            'z_episode': z_episode,
+            'inputs': inputs,
         }
 
     def kld(self, dist_a):
@@ -256,7 +283,22 @@ class DynamicKanervaMachine(AbstractVAE):
 
         """
         # reduce over the episode dimension for the KLD
-        return torch.mean(dist_a['memory_kl'] + dist_a['read_kl'] + dist_a['write_kl'], 0)
+        recon_x = self.decode(dist_a['z_episode'])
+        ae_loss = distributions.nll(x=dist_a['inputs'], recon_x=recon_x,
+                                    nll_type=self.config['nll_type'])  # TODO(jramapuram): move this into NLL
+        return torch.mean(dist_a['memory_kl'] + dist_a['read_kl'] + dist_a['write_kl'], 0) + ae_loss
+
+    def nll(self, x, recon_x, nll_type):
+        """ Grab the negative log-likelihood for a specific NLL type
+
+        :param x: the true tensor
+        :param recon_x: the reconstruction tensor
+        :param nll_type: the NLL type (str)
+        :returns: [B] dimensional tensor
+        :rtype: torch.Tensor
+
+        """
+        return distributions.nll(x, recon_x, nll_type)
 
     def loss_function(self, recon_x, x, params, K=1):
         """ Loss function for Kanerva ++

@@ -101,8 +101,10 @@ parser.add_argument('--sample-memory', action='store_true', default=False,
                     help='enables memory sampling vs. using mean (default: False)')
 parser.add_argument('--sample-w', action='store_true', default=False,
                     help='enables sampling the addressing vector w (default: False)')
-parser.add_argument('--num-opt-iters', type=int, default=10,
+parser.add_argument('--num-opt-iters', type=int, default=1,
                     help='number of optimization iterations for w and M (default: 10)')
+parser.add_argument('--attractor-cleanup-interations', type=int, default=3,
+                    help='number of iterations to re-encode generations (default: 3)')
 parser.add_argument('--code-size', type=int, default=100,
                     help='code size for memory operations (default: 100)')
 parser.add_argument('--memory-size', type=int, default=32,
