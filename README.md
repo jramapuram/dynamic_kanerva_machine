@@ -28,7 +28,35 @@ If you want to setup your own environment use:
 
 ``` bash
 # This should get to ~64.5 nats for the conditional ELBO.
-sh docker/run.sh "python main.py --encoder-activation=relu --decoder-activation=relu --batch-size=32 --conv-normalization=groupnorm --task=binarized_mnist --decoder-layer-type=conv --dense-normalization=none --encoder-layer-type=conv --epochs=500 --kl-beta=1.0 --latent-size=512 --lr=1e-4 --memory-size=32 --nll-type=bernoulli --optimizer=lars_adam --warmup=10 --lr-update-schedule=cosine --encoder-layer-modifier=none --decoder-layer-modifier=none --clip=0 --episode-length=32 --workers-per-replica=2 --monte-carlo-posterior-samples=1 --weight-decay=0 --uid=kanBasev02_6 --num-opt-iters=1 --log-dir=./dkm/logs --model-dir=./dkm/models" 0  # tailing 0 runs on cuda device 0
+# The tensorboard logs should be saved in ./dkm/logs
+sh docker/run.sh "python main.py --encoder-activation=relu \
+                                 --decoder-activation=relu \ 
+                                 --batch-size=32 \
+                                 --conv-normalization=groupnorm \
+                                 --task=binarized_mnist \
+                                 --decoder-layer-type=conv \
+                                 --dense-normalization=none \
+                                 --encoder-layer-type=conv \
+                                 --epochs=500 \
+                                 --kl-beta=1.0 \
+                                 --latent-size=512 \
+                                 --lr=1e-4 \
+                                 --memory-size=32 \
+                                 --nll-type=bernoulli \
+                                 --optimizer=lars_adam \
+                                 --warmup=10 \
+                                 --lr-update-schedule=cosine \
+                                 --encoder-layer-modifier=none \
+                                 --decoder-layer-modifier=none \
+                                 --clip=0 \
+                                 --episode-length=32 \
+                                 --workers-per-replica=2 \
+                                 --monte-carlo-posterior-samples=1 \
+                                 --weight-decay=0 \
+                                 --uid=kanBasev00_0 \
+                                 --num-opt-iters=1 \
+                                 --log-dir=./dkm/logs \
+                                 --model-dir=./dkm/models" 0  # tailing 0 runs on cuda device 0
 ```
 
 #### Citation
