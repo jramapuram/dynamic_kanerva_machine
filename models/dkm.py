@@ -4,7 +4,9 @@ import torch
 import numpy as np
 import torch.nn as nn
 
+
 import helpers.layers as layers
+import helpers.distributions as dist
 from models.memory import KanervaMemory, MemoryState
 from models.vae.abstract_vae import AbstractVAE
 import helpers.distributions as distributions
@@ -62,62 +64,38 @@ class DynamicKanervaMachine(AbstractVAE):
         :rtype: nn.Module
 
         """
-        # Following for standard 2d image decoders:
-        enc_conf = deepcopy(self.config)
-        # enc_conf['encoder_layer_type'] = 'resnet50'
+        is_3d_model = 'tsm' in self.config['encoder_layer_type'] \
+            or 's3d' in self.config['encoder_layer_type']
+        import torchvision
         encoder = nn.Sequential(
-            layers.View([-1, *self.input_shape]),                                         # fold in: [T*B, C, H, W]
-            layers.get_encoder(**self.config)(
+            # fold in if we have a 3d model: [T*B, C, H, W]
+            layers.View([-1, *self.input_shape]) if not is_3d_model else layers.Identity(),
+            layers.get_encoder(
+                norm_first_layer=True, norm_last_layer=False,
+                layer_fn=torchvision.models.resnet18,
+                pretrained=False, num_segments=1,
+                temporal_pool=False, **self.config)
+            (
                 output_size=self.config['code_size']
             ),
-            # layers.get_torchvision_encoder(**enc_conf)(
-            #     # output_size=self.config['latent_size'],
-            #     output_size=self.config['code_size']
-            # ),
             layers.View([-1, self.config['episode_length'], self.config['code_size']])  # un-fold episode to [T, B, F]
-            # layers.View([-1, self.config['episode_length'], self.config['latent_size']])  # un-fold episode to [T, B, F]
         )
+        is_torchvision_encoder = isinstance(encoder[1], (layers.TSMResnetEncoder,
+                                                         layers.S3DEncoder,
+                                                         layers.TorchvisionEncoder))
+        if self.config['encoder_layer_modifier'] == 'sine' and is_torchvision_encoder:
+            layers.convert_to_sine_module(encoder[1].model)
 
-        # encoder = layers.S3DEncoder(
-        #     output_size=self.config['latent_size'],
-        #     latent_size=self.config['latent_size'],
-        #     activation_str=self.config['encoder_activation'],
-        #     conv_normalization_str='none', # self.config['conv_normalization'],
-        #     dense_normalization_str='none', # self.config['dense_normalization'],
-        #     norm_first_layer=False,
-        #     norm_last_layer=False,
-        #     pretrained=False
-        # )
+        if is_torchvision_encoder and self.config['encoder_activation'] != 'relu':
+            layers.convert_layer(encoder[1].model, nn.ReLU,
+                                 layers.str_to_activ_module(self.config['encoder_activation']),
+                                 set_from_layer_kwargs=False)
 
-        # import torchvision
-        # encoder = layers.TSMResnetEncoder(
-        #     pretrained_output_size=512,
-        #     output_size=self.config['latent_size'],
-        #     latent_size=self.config['latent_size'],
-        #     activation_str=self.config['encoder_activation'],
-        #     conv_normalization_str=self.config['conv_normalization'],
-        #     dense_normalization_str=self.config['dense_normalization'],
-        #     norm_first_layer=True,
-        #     norm_last_layer=False,
-        #     layer_fn=torchvision.models.resnet18,
-        #     pretrained=False,
-        #     num_segments=1,  # self.config['episode_length'],
-        #     shift_div=self.config['shift_div'],
-        #     temporal_pool=False
-        # )
-        # if self.config['encoder_layer_modifier'] == 'sine':
-        #     layers.convert_layer(encoder.model,                 # remove BN
-        #                          from_layer=nn.BatchNorm2d,
-        #                          to_layer=layers.Identity,
-        #                          set_from_layer_kwargs=False)
-        #     layers.convert_layer(encoder.model,                 # remove ReLU
-        #                          from_layer=nn.ReLU,
-        #                          to_layer=layers.Identity,
-        #                          set_from_layer_kwargs=False)
-        #     layers.convert_layer(encoder.model,                 # replace Conv2d --> SineConv2d
-        #                          from_layer=nn.Conv2d,
-        #                          to_layer=layers.SineConv2d,
-        #                          set_from_layer_kwargs=True)
+        if is_torchvision_encoder and self.config['conv_normalization'] == 'groupnorm':
+            layers.convert_batchnorm_to_groupnorm(encoder[1].model)
+
+        if is_torchvision_encoder and self.config['conv_normalization'] == 'evonorms0':
+            layers.convert_batchnorm_to_evonorms0(encoder[1].model)
 
         return encoder
 
@@ -137,12 +115,14 @@ class DynamicKanervaMachine(AbstractVAE):
             layers.View([-1, self.config['code_size']]),
             layers.get_decoder(output_shape=dec_conf['input_shape'], **dec_conf)(
                 input_size=self.config['code_size']
-            ),
-            layers.View([-1, episode_length, *self.input_shape]),
+            )
         )
 
         # append the variance as necessary
         decoder = self._append_variance_projection(decoder)
+        output_shape = dec_conf['input_shape']
+        output_shape[0] *= 2 if dist.nll_has_variance(self.config['nll_type']) else 1
+        decoder = nn.Sequential(decoder, layers.View([-1, episode_length, *output_shape]))
         return torch.jit.script(decoder) if self.config['jit'] else decoder
 
     def _expand_memory(self, memory, batch_size):
@@ -222,9 +202,7 @@ class DynamicKanervaMachine(AbstractVAE):
         :rtype: torch.Tensor
 
         """
-        encoded = self.encoder(x)                              # Standard (non-temporal) encoder
-        # encoded = self.encoder(x, reduction='mean').squeeze()  # S3D with pooling
-        # encoded = self.encoder(x, reduction='none')              # TSM (no pooling)
+        encoded = self.encoder(x)
         if encoded.dim() < 2:
             return encoded.unsqueeze(-1)
 
@@ -241,27 +219,26 @@ class DynamicKanervaMachine(AbstractVAE):
 
         """
         inputs = torch.cat([i.unsqueeze(1) for i in x], 1)              # expand to [B, T, C, W, H]
-        batch_size = inputs.shape[0]
-        episode_size = inputs.shape[1]
+        batch_size, episode_size = [inputs.shape[0], inputs.shape[1]]
         z_episode = self.encode(inputs)                                 # [B, T, F] base logits.
 
         # Project the episode logits to write and read logits
-        read_logits = self.read_projector(z_episode).transpose(0, 1)    # [T, B, code_size] for DKM
-        write_logits = self.write_projector(z_episode).transpose(0, 1)  # [T, B, code_size] for DKM
+        # read_logits = self.read_projector(z_episode).transpose(0, 1)    # [T, B, code_size] for DKM
+        # write_logits = self.write_projector(z_episode).transpose(0, 1)  # [T, B, code_size] for DKM
+        read_logits = z_episode.transpose(0, 1)
+        write_logits = z_episode.transpose(0, 1)
 
         # Grab the prior and update it to the posterior given the episode
         prior_memory = self.memory.get_prior_state(batch_size)
-        # posterior_memory, _, dkl_w, _ = self.memory.update_state(z_episode.transpose(0, 1),
-        posterior_memory, _, dkl_w, _ = self.memory.update_state(write_logits,
-                                                                 prior_memory)  # dkl_w: [T, B]
+        posterior_memory, _, dkl_w, dkl_M = self.memory.update_state(write_logits,
+                                                                     prior_memory)  # dkl_w: [T, B]
 
         # Read from the memory & compute the total KL penalty
-        # read_z, dkl_r = self.memory.read_with_z(z_episode.transpose(0, 1),      # read_z: [T, B, code_size]
-        read_z, dkl_r = self.memory.read_with_z(read_logits,
-                                                posterior_memory)               # dkl_r: [T, B]
-        dkl_M = self.memory.get_dkl_total(posterior_memory)                     # dkl_M: [T, B]
+        read_z, dkl_r = self.memory.read_with_z(read_logits,              # read_z: [T, B, code_size]
+                                                posterior_memory)         # dkl_r: [T, B]
+        # dkl_M = self.memory.get_dkl_total(posterior_memory)             # dkl_M: [T, B]
 
-        return read_z.transpose(0, 1), {                                         # [B, T, code_size]
+        return read_z.transpose(0, 1), {                                  # read_z.T: [B, T, code_size]
             'memory_kl': dkl_M / episode_size,
             'read_kl': dkl_r / episode_size,
             'write_kl': dkl_w / episode_size,
@@ -269,9 +246,8 @@ class DynamicKanervaMachine(AbstractVAE):
             # We need an actual updated memory to generate samples.
             'memory_state': posterior_memory,
 
-            # track the episode to add for the AE loss
-            'z_episode': z_episode,
-            'inputs': inputs,
+            # add the auto-encoded projection (specified in paper)
+            'ae_decode': self.decode(z_episode),
         }
 
     def kld(self, dist_a):
@@ -283,10 +259,7 @@ class DynamicKanervaMachine(AbstractVAE):
 
         """
         # reduce over the episode dimension for the KLD
-        recon_x = self.decode(dist_a['z_episode'])
-        ae_loss = distributions.nll(x=dist_a['inputs'], recon_x=recon_x,
-                                    nll_type=self.config['nll_type'])  # TODO(jramapuram): move this into NLL
-        return torch.mean(dist_a['memory_kl'] + dist_a['read_kl'] + dist_a['write_kl'], 0) + ae_loss
+        return torch.mean(dist_a['memory_kl'] + dist_a['read_kl'] + dist_a['write_kl'], 0)
 
     def nll(self, x, recon_x, nll_type):
         """ Grab the negative log-likelihood for a specific NLL type
@@ -312,8 +285,13 @@ class DynamicKanervaMachine(AbstractVAE):
 
         """
         x = torch.cat([xi.unsqueeze(1) for xi in x], 1).contiguous()  # [B, T, C, H, W]
+
+        # compute the AE loss as specified in the paper
+        ae_loss = distributions.nll(x=x, recon_x=params['ae_decode'],
+                                    nll_type=self.config['nll_type'])
+
         loss_dict = super(DynamicKanervaMachine, self).loss_function(
-            recon_x=recon_x, x=x, params=params, K=K)
+            recon_x=recon_x, x=x, params=params, K=K, ae_loss=ae_loss)
 
         # Add extra tracking metrics
         loss_dict['bits_per_dim_recon_mean'] = (loss_dict['nll_mean'] / np.prod(self.input_shape)) / np.log(2)

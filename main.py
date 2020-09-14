@@ -339,10 +339,10 @@ def build_loader_model_grapher(args):
     if args.metrics_server is not None:
         network.test_images = get_numpy_dataset(task=args.task,
                                                 data_dir=args.data_dir,
-                                                test_transform=test_transform,
+                                                transform=test_transform,
                                                 split='test',
-                                                image_size=args.image_size_override,
-                                                cuda=args.cuda)
+                                                cuda=args.cuda,
+                                                workers_per_replica=args.workers_per_replica)
         print("Metrics test images: ", network.test_images.shape)
 
     # build the grapher object
