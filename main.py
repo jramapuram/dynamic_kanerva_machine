@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import tree
 import argparse
@@ -305,6 +306,7 @@ def build_loader_model_grapher(args):
     train_transform, test_transform = build_train_and_test_transforms()
     loader_dict = {'train_transform': train_transform,
                    'test_transform': test_transform, **vars(args)}
+    loader_dict['batch_size'] *= args.episode_length if args.task != 'dmlab_mazes' else 1
     loader = get_loader(**loader_dict)
 
     # set the input tensor shape (ignoring batch dimension) and related dataset sizing
@@ -369,17 +371,15 @@ def lazy_generate_modules(model, loader):
 
     """
     model.eval()
-    minibatches, labels = [], []
 
     for minibatch, label in loader:
         with torch.no_grad():
             minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
             label = label.cuda(non_blocking=True) if args.cuda else label
 
-            if len(minibatches) < args.episode_length:
-                minibatches.append(minibatch)
-                labels.append(label)
-                continue
+            if minibatch.dim() == 4 or minibatch.dim() == 2:
+                minibatch = minibatch.view([-1, args.episode_length, *minibatch.shape[1:]])
+                label = label.view([-1, args.episode_length, *label.shape[1:]])
 
             # Some sanity prints on the minibatch and labels
             print("minibatch = {} / {} | labels = {} / {}".format(minibatch.shape,
@@ -391,16 +391,12 @@ def lazy_generate_modules(model, loader):
             if mb_max > 1.0 or mb_min < 0:
                 raise ValueError("Minibatch max > 1.0 or minibatch min < 0. You probably dont want this.")
 
-            _ = model(minibatches, labels=labels)
+            _ = model(minibatch, labels=label)
             break
 
     # initialize the polyak-ema op if it exists
     if args.polyak_ema > 0:
         layers.polyak_ema_parameters(model, args.polyak_ema)
-
-    # cleanups
-    minibatches.clear()
-    labels.clear()
 
 
 def register_plots(loss, grapher, epoch, prefix='train', force_sync=False):
@@ -489,29 +485,26 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     assert optimizer is None if is_eval else optimizer is not None
     loss_map, num_samples = {}, 0
 
-    # cache a list of minibatches, since the memory model needs an episode
-    minibatches = []
-
     # iterate over data and labels
     for num_minibatches, (minibatch, labels) in enumerate(loader):
         minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
         labels = labels.cuda(non_blocking=True) if args.cuda else labels
 
         # build an episode of minibatch samples
-        if len(minibatches) < args.episode_length:
-            minibatches.append(minibatch)
-            continue
+        if minibatch.dim() == 4 or minibatch.dim() == 2:
+            minibatch = minibatch.view([-1, args.episode_length, *minibatch.shape[1:]])
+            labels = labels.view([-1, args.episode_length, *labels.shape[1:]])
 
         with torch.no_grad() if is_eval else utils.dummy_context():
             if is_eval and args.polyak_ema > 0:                                # use the Polyak model for predictions
                 pred_logits, reparam_map = layers.get_polyak_prediction(
-                    model, pred_fn=functools.partial(model, minibatches, labels=labels))
+                    model, pred_fn=functools.partial(model, minibatch, labels=labels))
             else:
-                pred_logits, reparam_map = model(minibatches, labels=labels)     # get normal predictions
+                pred_logits, reparam_map = model(minibatch, labels=labels)     # get normal predictions
 
             # compute loss
             loss_t = model.loss_function(recon_x=pred_logits,
-                                         x=minibatches,
+                                         x=minibatch,
                                          params=reparam_map,
                                          K=args.monte_carlo_posterior_samples)
             loss_map = loss_t if not loss_map else tree.map_structure(         # aggregate loss
@@ -537,12 +530,6 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
             del loss_t
 
-        # clear the list to prevent OOM
-        minibatches_tensor = torch.cat(  # [B, T, C, H, W]
-            [xi.unsqueeze(1) for xi in minibatches], 1).contiguous()
-        minibatches_tensor = minibatches_tensor.view(-1, *minibatches_tensor.shape[-3:])  # fold into batch
-        minibatches.clear()
-
         if args.debug_step and num_minibatches > 1:  # for testing purposes
             break
 
@@ -550,16 +537,9 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     loss_map = tree.map_structure(
         lambda v: v / (num_minibatches + 1), loss_map)                          # reduce the map to get actual means
 
-    # log some stuff
-    def tensor2item(t): return t.detach().item() if isinstance(t, torch.Tensor) else t
-    to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
-    print(to_log.format(
-        prefix, args.distributed_rank, epoch, num_samples, time.time() - start_time,
-        tensor2item(loss_map['loss_mean']),
-        tensor2item(loss_map['elbo_mean']),
-        tensor2item(loss_map['nll_mean']),
-        tensor2item(loss_map['kld_mean']),
-        tensor2item(loss_map['mut_info_mean'])))
+    # calculate the true likelihood by marginalizing out the latent variable
+    if epoch > 0 and epoch % 20 == 0 and is_eval:
+        loss_map['likelihood_mean'] = model.likelihood(loader, K=1000)
 
     # activate the logits of the reconstruction and get the dict
     reconstr_map = model.get_activated_reconstructions(pred_logits)
@@ -576,8 +556,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     # also grab the memory images for visualization and the input images
     reconstr_map = model.get_activated_reconstructions(pred_logits)
     memory_imgs = model.get_images_from_reparam(reparam_map)
-    resize_shp = min(64, args.input_shape[-1])
-    input_images = {'input_imgs': F.interpolate(minibatches_tensor, size=(resize_shp, resize_shp))}
+    input_images = {'input_imgs': minibatch.view(-1, *minibatch.shape[-3:])}
 
     # tack on remote metrics information if requested; do it in-frequently
     if args.metrics_server is not None and not is_eval:  # only eval train generations due to BN
@@ -590,17 +569,22 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         generated_map = model.generate_synthetic_samples(
             args.batch_size, memory_state=reparam_map['memory_state'])
 
-    def reduce_num_images(image_dict, num_to_post):        # XXX: parameterize
-        for k in image_dict:
-            if 'generated' not in k:
-                image_dict[k] = image_dict[k][0:num_to_post]
-
-        return image_dict
-
+    # combine the image dicts and post to the grapher instance
+    def resize_imgs(imgs): return F.interpolate(imgs, min(128, imgs.shape[-1]))
+    def reduce_num_images(struct, num): return tree.map_structure(lambda v: resize_imgs(v[-num:]), struct)
     image_map = reduce_num_images({**reconstr_map, **memory_imgs, **input_images, **generated_map}, 64)
     register_images(image_map, grapher, epoch, prefix=prefix)
-    if grapher is not None:
-        grapher.save()
+
+    # log some stuff
+    def tensor2item(t): return t.detach().item() if isinstance(t, torch.Tensor) else t
+    to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
+    print(to_log.format(
+        prefix, args.distributed_rank, epoch, num_samples, time.time() - start_time,
+        tensor2item(loss_map['loss_mean']),
+        tensor2item(loss_map['elbo_mean']),
+        tensor2item(loss_map['nll_mean']),
+        tensor2item(loss_map['kld_mean']),
+        tensor2item(loss_map['mut_info_mean'])))
 
     # cleanups (see https://tinyurl.com/ycjre67m) + return ELBO for early stopping
     loss_val = tensor2item(loss_map['elbo_mean']) if args.vae_type != 'autoencoder' \
@@ -771,6 +755,11 @@ def run(rank, args):
                 config_to_post['slurm_job_id'] = slurm_id
 
             grapher.add_text('config', pprint.PrettyPrinter(indent=4).pformat(config_to_post), 0)
+            grapher.add_text('model', str(model), 0)
+            grapher.add_text('command', 'python ' + " ".join(sys.argv), 0)
+
+        if grapher is not None:
+            grapher.save()
 
 
 if __name__ == "__main__":

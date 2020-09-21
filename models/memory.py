@@ -67,7 +67,7 @@ def lstsq(A, Y, lamb=0.0):
             q, r = torch.qr(A)
             x = torch.inverse(r) @ q.T @ Y
         else:
-            A_dash = A.permute(1, 0) @ A + lamb * torch.eye(cols)
+            A_dash = A.permute(1, 0) @ A + lamb * torch.eye(cols, device=A.device)
             Y_dash = A.permute(1, 0) @ Y
             x = lstsq(A_dash, Y_dash)
 

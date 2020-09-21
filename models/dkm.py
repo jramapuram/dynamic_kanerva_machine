@@ -1,5 +1,6 @@
 from copy import deepcopy
 
+import tree
 import torch
 import numpy as np
 import torch.nn as nn
@@ -172,8 +173,8 @@ class DynamicKanervaMachine(AbstractVAE):
 
         """
         with torch.no_grad():
-            # expand the memory if needed
-            memory_state = self._expand_memory(memory_state, batch_size)  # TODO(jramapuram): maybe issue here.
+            # expand the memory if needed, simply tiles to get to batch_size memories
+            memory_state = self._expand_memory(memory_state, batch_size)
 
             episode_length = self.config['episode_length']
             w_samples = self.memory.sample_prior_w(seq_length=episode_length,
@@ -182,17 +183,16 @@ class DynamicKanervaMachine(AbstractVAE):
             z_read, _ = self.memory.read_with_z(z=z_samples, memory_state=memory_state)
 
             # Decode the read samples & return
-            generations = [self.nll_activation(self.decode(z_read))]
+            generations = {'generated0_imgs': self.nll_activation(self.decode(z_read))}
 
             # do the attractor cleanup iterations
-            for _ in range(self.config['attractor_cleanup_interations']):
-                generations.append(self._attractor_loop(generations[-1], memory_state))
+            for idx in range(1, self.config['attractor_cleanup_interations'] + 1):
+                previous_generations = generations['generated{}_imgs'.format(idx - 1)]
+                generations['generated{}_imgs'.format(idx)] = self._attractor_loop(
+                    previous_generations, memory_state)
 
-            generations = torch.cat(generations, 0)
-            return {
-                # Fold in episode into batch and return for visualization.
-                'generated_imgs': generations.view([-1, *generations.shape[-3:]])
-            }
+            # Fold in episode into batch and return for visualization.
+            return tree.map_structure(lambda t: t.view([-1, *t.shape[-3:]]), generations)
 
     def encode(self, x):
         """ Encodes a tensor x to a set of logits.
@@ -208,7 +208,51 @@ class DynamicKanervaMachine(AbstractVAE):
 
         return encoded
 
-    def posterior(self, x, labels=None, force=False):
+    def preprocess_minibatch_and_labels(self, minibatch, labels):
+        """Simple helper to push the minibatch to the correct device and shape."""
+        minibatch = minibatch.cuda(non_blocking=True) if self.config['cuda'] else minibatch
+        labels = labels.cuda(non_blocking=True) if self.config['cuda'] else labels
+
+        if minibatch.dim() == 4 or minibatch.dim() == 2:
+            minibatch = minibatch.view([-1, self.config['episode_length'], *minibatch.shape[1:]])
+            labels = labels.view([-1, self.config['episode_length'], *labels.shape[1:]])
+
+        return minibatch, labels
+
+    def likelihood(self, loader, K=1000):
+        """ Likelihood by integrating ELBO.
+
+        :param loader: the data loader to iterate over.
+        :param K: number of importance samples.
+        :returns: likelihood produced by monte-carlo integration of elbo.
+        :rtype: float32
+
+        """
+        with torch.no_grad():
+            likelihood = []
+
+            for num_minibatches, (minibatch, labels) in enumerate(loader):
+                minibatch, labels = self.preprocess_minibatch_and_labels(minibatch, labels)
+                batch_size = minibatch.shape[0]
+
+                for idx in range(batch_size):
+                    minibatch_i = minibatch[idx].expand_as(minibatch).contiguous()
+                    labels_i = labels[idx].expand_as(labels).contiguous()
+
+                    elbo = []
+                    for count in range(K // batch_size):
+                        z, params = self.posterior(minibatch_i, labels=labels_i)
+                        decoded_logits = self.decode(z)
+                        loss_t = self.loss_function(decoded_logits, minibatch_i, params)
+                        elbo.append(loss_t['elbo'])
+
+                    # compute the log-sum-exp of the elbo of the single sample taken over K replications
+                    multi_sample_elbo = torch.cat([e.unsqueeze(0) for e in elbo], 0).view([-1])
+                    likelihood.append(torch.logsumexp(multi_sample_elbo, dim=0) - np.log(count + 1))
+
+            return torch.mean(torch.cat([l.unsqueeze(0) for l in likelihood], 0))
+
+    def posterior(self, inputs, labels=None, force=False):
         """ get a reparameterized Q(z|x) for a given x
 
         :param x: input tensor
@@ -218,15 +262,16 @@ class DynamicKanervaMachine(AbstractVAE):
         :rtype: torch.Tensor
 
         """
-        inputs = torch.cat([i.unsqueeze(1) for i in x], 1)              # expand to [B, T, C, W, H]
+        if isinstance(inputs, (list, tuple)):
+            inputs = torch.cat([i.unsqueeze(1) for i in inputs], 1)     # expand to [B, T, C, W, H]
+
         batch_size, episode_size = [inputs.shape[0], inputs.shape[1]]
         z_episode = self.encode(inputs)                                 # [B, T, F] base logits.
 
         # Project the episode logits to write and read logits
         # read_logits = self.read_projector(z_episode).transpose(0, 1)    # [T, B, code_size] for DKM
         # write_logits = self.write_projector(z_episode).transpose(0, 1)  # [T, B, code_size] for DKM
-        read_logits = z_episode.transpose(0, 1)
-        write_logits = z_episode.transpose(0, 1)
+        read_logits = write_logits = z_episode.transpose(0, 1)
 
         # Grab the prior and update it to the posterior given the episode
         prior_memory = self.memory.get_prior_state(batch_size)
@@ -271,7 +316,8 @@ class DynamicKanervaMachine(AbstractVAE):
         :rtype: torch.Tensor
 
         """
-        return distributions.nll(x, recon_x, nll_type)
+        episode_len = x.shape[1]
+        return distributions.nll(x, recon_x, nll_type) / episode_len
 
     def loss_function(self, recon_x, x, params, K=1):
         """ Loss function for Kanerva ++
@@ -284,7 +330,8 @@ class DynamicKanervaMachine(AbstractVAE):
         :rtype: dict
 
         """
-        x = torch.cat([xi.unsqueeze(1) for xi in x], 1).contiguous()  # [B, T, C, H, W]
+        if isinstance(x, (list, tuple)):
+            x = torch.cat([xi.unsqueeze(1) for xi in x], 1).contiguous()  # [B, T, C, H, W]
 
         # compute the AE loss as specified in the paper
         ae_loss = distributions.nll(x=x, recon_x=params['ae_decode'],
